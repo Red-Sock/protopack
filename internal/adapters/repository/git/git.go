@@ -3,8 +3,12 @@ package git
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"golang.org/x/net/html"
 
 	"go.redsock.ru/protopack/internal/adapters/repository"
 )
@@ -41,9 +45,14 @@ type Console interface {
 // remote: full remoteURL address without schema
 func New(ctx context.Context, remote string, cacheDir string, console Console) (repository.Repo, error) {
 	r := &gitRepo{
-		remoteURL: getRemote(remote),
-		cacheDir:  cacheDir,
-		console:   console,
+		cacheDir: cacheDir,
+		console:  console,
+	}
+
+	var err error
+	r.remoteURL, err = getRemote(remote)
+	if err != nil {
+		return nil, fmt.Errorf("%w", err)
 	}
 
 	if _, err := os.Stat(filepath.Join(r.cacheDir, "objects")); err == nil {
@@ -55,7 +64,7 @@ func New(ctx context.Context, remote string, cacheDir string, console Console) (
 		return nil, fmt.Errorf("adapters.RunCmd (init): %w", err)
 	}
 
-	_, err := r.console.RunCmd(ctx, r.cacheDir, "git", "remote", "add", "origin", r.remoteURL)
+	_, err = r.console.RunCmd(ctx, r.cacheDir, "git", "remote", "add", "origin", r.remoteURL)
 	if err != nil {
 		return nil, fmt.Errorf("adapters.RunCmd (add origin): %w", err)
 	}
@@ -63,6 +72,43 @@ func New(ctx context.Context, remote string, cacheDir string, console Console) (
 	return r, nil
 }
 
-func getRemote(name string) string {
-	return "https://" + name
+func getRemote(remoteURL string) (string, error) {
+	remoteURL = "https://" + remoteURL
+	resp, err := http.Get(remoteURL)
+	if err != nil {
+		return "", fmt.Errorf("reading page: %w", err)
+	}
+
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "meta" {
+			var metaName, content string
+			for _, attr := range n.Attr {
+				if attr.Key == "name" && attr.Val == "go-import" {
+					metaName = attr.Val
+				}
+				if attr.Key == "content" {
+					content = attr.Val
+				}
+			}
+			if metaName == "go-import" && content != "" {
+				// The content has format: "<import-prefix> <vcs> <repo-url>"
+				parts := strings.Fields(content)
+				if len(parts) == 3 {
+					remoteURL = parts[2]
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+	f(doc)
+
+	return remoteURL, nil
 }
